@@ -1,0 +1,9 @@
+flask
+python-dotenv
+yt-dlp
+ffmpeg-python
+playwright
+pyrogram
+tgcrypto
+requests
+gunicorn
