@@ -1,6 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-
-[deploy]
-startCommand = "gunicorn app:app --workers 1 --threads 8 --timeout 3600 --worker-class gthread --bind 0.0.0.0:$PORT"
-restartPolicyType = "ON_FAILURE"
