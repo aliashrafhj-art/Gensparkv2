@@ -34,6 +34,7 @@ async function uploadToDrive(filePath, fileName) {
     requestBody: { name: fileName, parents: DRIVE_FOLDER_ID ? [DRIVE_FOLDER_ID] : [] },
     media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) },
     fields: 'id, name, webViewLink',
+    supportsAllDrives: true,
   });
   return response.data;
 }
