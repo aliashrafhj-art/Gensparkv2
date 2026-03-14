@@ -1,5 +1,4 @@
 const express = require('express');
-const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
@@ -11,38 +10,76 @@ app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3000;
 const DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
-const SERVICE_ACCOUNT_JSON = process.env.SERVICE_ACCOUNT_JSON;
 const TRIM_SECONDS = parseFloat(process.env.TRIM_SECONDS || '4');
 
-const jobs = {};
+const DRIVE_CLIENT_ID = process.env.DRIVE_CLIENT_ID;
+const DRIVE_CLIENT_SECRET = process.env.DRIVE_CLIENT_SECRET;
+const DRIVE_REFRESH_TOKEN = process.env.DRIVE_REFRESH_TOKEN;
 
+const jobs = {};
 const MOBILE_UA = 'Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36';
 
-// ─── Google Drive ────────────────────────────────────────────────
-function getDriveClient() {
-  const credentials = JSON.parse(SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive.file'],
+// ─── OAuth: get fresh access token ──────────────────────────────
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getAccessToken() {
+  if (cachedToken && Date.now() < tokenExpiry - 60000) return cachedToken;
+  const fetch = (await import('node-fetch')).default;
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: DRIVE_CLIENT_ID,
+      client_secret: DRIVE_CLIENT_SECRET,
+      refresh_token: DRIVE_REFRESH_TOKEN,
+      grant_type: 'refresh_token',
+    }),
   });
-  return google.drive({ version: 'v3', auth });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Token refresh failed: ' + JSON.stringify(data));
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+  console.log('[TOKEN] Refreshed OK');
+  return cachedToken;
 }
 
+// ─── Drive Upload (multipart, same as Newtest) ───────────────────
 async function uploadToDrive(filePath, fileName) {
-  const drive = getDriveClient();
-  const response = await drive.files.create({
-    requestBody: { name: fileName, parents: DRIVE_FOLDER_ID ? [DRIVE_FOLDER_ID] : [] },
-    media: { mimeType: 'video/mp4', body: fs.createReadStream(filePath) },
-    fields: 'id, name, webViewLink',
-    supportsAllDrives: true,
+  const fetch = (await import('node-fetch')).default;
+  const token = await getAccessToken();
+  const boundary = '-------314159265358979323846';
+  const metadata = JSON.stringify({
+    name: fileName,
+    parents: DRIVE_FOLDER_ID ? [DRIVE_FOLDER_ID] : [],
   });
-  return response.data;
+  const fileBuffer = fs.readFileSync(filePath);
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Type: video/mp4\r\n\r\n`),
+    fileBuffer,
+    Buffer.from(`\r\n--${boundary}--`),
+  ]);
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': `multipart/related; boundary=${boundary}`,
+      'Content-Length': body.length,
+    },
+    body,
+  });
+  if (!res.ok) throw new Error('Drive upload failed: ' + await res.text());
+  const data = await res.json();
+  return {
+    name: data.name,
+    webViewLink: `https://drive.google.com/file/d/${data.id}/view`,
+  };
 }
 
-// ─── Kuaishou: resolve + get video URL (same as Newtest) ─────────
+// ─── Kuaishou: resolve + GraphQL (same as Newtest) ───────────────
 async function getKuaishouVideoUrl(shortUrl) {
   const fetch = (await import('node-fetch')).default;
-
   const headers = {
     'User-Agent': MOBILE_UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -50,7 +87,6 @@ async function getKuaishouVideoUrl(shortUrl) {
     'Referer': 'https://www.kuaishou.com/',
   };
 
-  // Step 1: Resolve short URL
   const pageRes = await fetch(shortUrl, { redirect: 'follow', headers });
   const finalUrl = pageRes.url;
   const html = await pageRes.text();
@@ -59,7 +95,6 @@ async function getKuaishouVideoUrl(shortUrl) {
   let videoUrl = null;
   let title = 'kuaishou_video';
 
-  // Step 2: Extract photoId
   const photoIdMatch = finalUrl.match(/featured\/(\w+)/)
     || finalUrl.match(/photoId=([a-zA-Z0-9_-]+)/)
     || finalUrl.match(/\/fw\/photo\/([a-zA-Z0-9_-]+)/)
@@ -68,8 +103,6 @@ async function getKuaishouVideoUrl(shortUrl) {
   if (photoIdMatch) {
     const photoId = photoIdMatch[1];
     console.log('[KS] photoId:', photoId);
-
-    // Step 3: GraphQL via video.kuaishou.com (same as Newtest — works without captcha)
     try {
       const gqlRes = await fetch('https://video.kuaishou.com/graphql', {
         method: 'POST',
@@ -87,12 +120,9 @@ async function getKuaishouVideoUrl(shortUrl) {
         videoUrl = photo.photoUrl;
         title = (photo.caption || photoId).replace(/\n/g, '').trim();
       }
-    } catch (e) {
-      console.warn('[KS] GraphQL error:', e.message);
-    }
+    } catch (e) { console.warn('[KS] GraphQL error:', e.message); }
   }
 
-  // Step 4: HTML fallback
   if (!videoUrl) {
     const patterns = [
       /"photoUrl"\s*:\s*"([^"]+)"/,
@@ -108,11 +138,9 @@ async function getKuaishouVideoUrl(shortUrl) {
     }
   }
 
-  if (!videoUrl) throw new Error('Video URL বের করা গেলো না (region blocked বা private)');
-
+  if (!videoUrl) throw new Error('Video URL বের করা গেলো না');
   const titleMatch = html.match(/"caption"\s*:\s*"([^"]+)"/) || html.match(/<title>([^<]+)<\/title>/);
   if (titleMatch && title === 'kuaishou_video') title = titleMatch[1].replace(/\s*[-|].*$/, '').trim();
-
   return { videoUrl, title };
 }
 
@@ -132,50 +160,35 @@ function ytdlpDownload(url, outputDir) {
   return new Promise((resolve, reject) => {
     const outputTemplate = path.join(outputDir, '%(title)s.%(ext)s');
     const cmd = `yt-dlp --no-playlist --merge-output-format mp4 -o "${outputTemplate}" "${url}"`;
-    console.log('[YTDLP]', url);
     exec(cmd, { timeout: 180000 }, (error, stdout, stderr) => {
       if (error) { reject(new Error('[yt-dlp] ' + (stderr || error.message))); return; }
       const files = fs.readdirSync(outputDir).filter(f => f.endsWith('.mp4'));
       if (files.length === 0) { reject(new Error('[yt-dlp] No mp4 found')); return; }
-      const filePath = path.join(outputDir, files[files.length - 1]);
-      const title = path.basename(files[files.length - 1], '.mp4');
-      resolve({ filePath, title });
+      resolve({ filePath: path.join(outputDir, files[files.length - 1]), title: path.basename(files[files.length - 1], '.mp4') });
     });
   });
 }
 
 // ─── FFmpeg Trim ─────────────────────────────────────────────────
-function getVideoDuration(filePath) {
+function trimVideo(inputPath, outputDir) {
   return new Promise((resolve, reject) => {
-    exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+    exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`,
       (err, stdout) => {
-        if (err) { reject(new Error('ffprobe failed')); return; }
-        const d = parseFloat(stdout.trim());
-        if (isNaN(d)) { reject(new Error('Invalid duration')); return; }
-        resolve(d);
+        if (err) { resolve(inputPath); return; }
+        const duration = parseFloat(stdout.trim());
+        const trimmed = duration - TRIM_SECONDS;
+        if (isNaN(trimmed) || trimmed <= 2) { resolve(inputPath); return; }
+        const ext = path.extname(inputPath);
+        const outPath = path.join(outputDir, path.basename(inputPath, ext) + '_trimmed' + ext);
+        exec(`ffmpeg -i "${inputPath}" -t ${trimmed.toFixed(3)} -c copy "${outPath}" -y`, { timeout: 120000 },
+          (e) => {
+            if (e) { resolve(inputPath); return; }
+            try { fs.unlinkSync(inputPath); } catch {}
+            resolve(outPath);
+          }
+        );
       }
     );
-  });
-}
-
-function trimVideo(inputPath, outputDir) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const duration = await getVideoDuration(inputPath);
-      const trimmedDuration = duration - TRIM_SECONDS;
-      if (trimmedDuration <= 2) { resolve(inputPath); return; }
-      const ext = path.extname(inputPath);
-      const base = path.basename(inputPath, ext);
-      const outputPath = path.join(outputDir, `${base}_trimmed${ext}`);
-      exec(`ffmpeg -i "${inputPath}" -t ${trimmedDuration.toFixed(3)} -c copy "${outputPath}" -y`,
-        { timeout: 120000 },
-        (err, stdout, stderr) => {
-          if (err) { reject(new Error('ffmpeg failed: ' + stderr)); return; }
-          try { fs.unlinkSync(inputPath); } catch {}
-          resolve(outputPath);
-        }
-      );
-    } catch (e) { reject(e); }
   });
 }
 
@@ -201,32 +214,25 @@ async function processJob(jobId) {
     try {
       let rawPath, title;
 
-      // Method 1: node-fetch + video.kuaishou.com/graphql (same as Newtest)
       try {
         job.emitter.emit('event', { type: 'fetching', index: i, url: rawUrl });
         const info = await getKuaishouVideoUrl(rawUrl);
         title = info.title;
-
         job.emitter.emit('event', { type: 'downloading', index: i, url: rawUrl, title });
         rawPath = path.join(videoDir, sanitizeFilename(title));
         await downloadVideo(info.videoUrl, rawPath);
         console.log('[METHOD1] OK:', title);
-
       } catch (apiErr) {
-        // Method 2: yt-dlp fallback
-        console.log('[METHOD1] Failed:', apiErr.message, '— trying yt-dlp...');
+        console.log('[METHOD1] Failed:', apiErr.message, '— yt-dlp...');
         job.emitter.emit('event', { type: 'downloading', index: i, url: rawUrl, title: 'yt-dlp...' });
         const ytResult = await ytdlpDownload(rawUrl, videoDir);
         rawPath = ytResult.filePath;
         title = ytResult.title;
-        console.log('[METHOD2] yt-dlp OK:', title);
       }
 
-      // Trim
       job.emitter.emit('event', { type: 'trimming', index: i, url: rawUrl });
       const trimmedPath = await trimVideo(rawPath, videoDir);
 
-      // Upload
       const finalName = sanitizeFilename(path.basename(trimmedPath, path.extname(trimmedPath)));
       job.emitter.emit('event', { type: 'uploading', index: i, url: rawUrl, fileName: finalName });
       const driveFile = await uploadToDrive(trimmedPath, finalName);
@@ -255,7 +261,6 @@ app.post('/start', (req, res) => {
   const { urls } = req.body;
   if (!urls || !Array.isArray(urls) || urls.length === 0)
     return res.status(400).json({ error: 'No URLs provided' });
-
   const jobId = `job_${Date.now()}`;
   jobs[jobId] = { urls, results: [], status: 'queued', emitter: new EventEmitter() };
   jobs[jobId].emitter.setMaxListeners(50);
@@ -266,20 +271,16 @@ app.post('/start', (req, res) => {
 app.get('/progress/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).end();
-
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
   if (job.status === 'completed') {
     job.results.forEach(r => send({ type: r.status === 'success' ? 'done' : 'error', ...r }));
     send({ type: 'completed' });
     return res.end();
   }
-
   const handler = (data) => {
     send(data);
     if (data.type === 'completed') { job.emitter.removeListener('event', handler); res.end(); }
