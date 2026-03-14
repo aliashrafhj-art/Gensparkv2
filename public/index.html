@@ -1,1 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>KS Bulk Downloader</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0f0f0f;color:#eee;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px}
+    h1{font-size:1.8rem;margin-bottom:6px;color:#ff5c00}
+    p.sub{color:#888;margin-bottom:30px;font-size:.9rem}
+    .card{background:#1a1a1a;border-radius:12px;padding:28px;width:100%;max-width:700px;border:1px solid #2a2a2a}
+    label{display:block;font-size:.85rem;color:#aaa;margin-bottom:8px}
+    textarea{width:100%;height:200px;background:#111;border:1px solid #333;border-radius:8px;color:#eee;font-size:.88rem;padding:12px;resize:vertical;outline:none;line-height:1.7}
+    textarea:focus{border-color:#ff5c00}
+    .url-count{font-size:.78rem;color:#666;margin-top:6px;text-align:right}
+    button{margin-top:14px;width:100%;padding:13px;background:#ff5c00;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}
+    button:hover{background:#e04e00}
+    button:disabled{background:#444;cursor:not-allowed}
+    .progress-wrap{margin-top:16px;background:#111;border-radius:8px;padding:12px 14px;display:none}
+    .progress-header{display:flex;justify-content:space-between;font-size:.82rem;color:#aaa;margin-bottom:8px}
+    .progress-bar-bg{background:#222;border-radius:6px;height:8px;overflow:hidden}
+    .progress-bar{height:100%;background:#ff5c00;transition:width .4s;width:0%}
+    .current-status{font-size:.75rem;color:#888;margin-top:8px;min-height:16px}
+    #results{margin-top:20px;width:100%;max-width:700px;display:flex;flex-direction:column;gap:8px}
+    .result-item{background:#1a1a1a;border-radius:8px;padding:12px 16px;border-left:4px solid #333;font-size:.83rem}
+    .result-item.success{border-left-color:#22c55e}
+    .result-item.failed{border-left-color:#ef4444}
+    .result-item.processing{border-left-color:#f59e0b}
+    .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.72rem;font-weight:700;margin-bottom:5px}
+    .badge.success{background:#14532d;color:#86efac}
+    .badge.failed{background:#450a0a;color:#fca5a5}
+    .badge.processing{background:#451a03;color:#fcd34d}
+    .url-text{color:#555;word-break:break-all;margin-bottom:4px;font-size:.76rem}
+    .title-text{color:#bbb;margin-bottom:3px;font-size:.8rem}
+    .file-name{color:#ddd;font-weight:600;margin-bottom:3px}
+    .drive-link a{color:#ff5c00;text-decoration:none;font-size:.8rem}
+    .error-msg{color:#f87171}
+    .summary{margin-top:10px;padding:10px 14px;background:#1a1a1a;border-radius:8px;font-size:.85rem;color:#aaa;text-align:center;display:none}
+    .summary span{font-weight:700;color:#eee}
+    .step-indicator{font-size:.74rem;color:#888;margin-top:2px}
+  </style>
+</head>
+<body>
+  <h1>🎬 KS Bulk Downloader</h1>
+  <p class="sub">Kuaishou short URLs paste করো → Auto download → Trim → Google Drive</p>
 
+  <div class="card">
+    <label>Video URLs (প্রতি লাইনে একটি — সর্বোচ্চ ৪০টা)</label>
+    <textarea id="urlInput" placeholder="https://v.kuaishou.com/7G0GvEYw&#10;https://v.kuaishou.com/JsF8J6m8&#10;https://v.kuaishou.com/JDpeubkR" oninput="updateCount()"></textarea>
+    <div class="url-count" id="urlCount">0 URLs</div>
+
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-header">
+        <span id="progressLabel">শুরু হচ্ছে...</span>
+        <span id="progressFraction">0 / 0</span>
+      </div>
+      <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="current-status" id="currentStatus"></div>
+    </div>
+
+    <button id="startBtn" onclick="startDownload()">⬇️ Download & Save to Drive</button>
+  </div>
+
+  <div class="summary" id="summary"></div>
+  <div id="results"></div>
+
+  <script>
+    const STEP_LABELS = {
+      resolving:   '🔗 Short URL resolve করছে...',
+      fetching:    '📡 Video info নিচ্ছে (GraphQL)...',
+      downloading: '⬇️ Download হচ্ছে...',
+      trimming:    '✂️ শেষ ৪ সেকেন্ড কাটছে...',
+      uploading:   '☁️ Google Drive-এ upload হচ্ছে...',
+    };
+
+    function updateCount() {
+      const urls = getUrls();
+      document.getElementById('urlCount').textContent = urls.length + ' URLs';
+    }
+
+    function getUrls() {
+      return document.getElementById('urlInput').value
+        .split('\n').map(u => u.trim()).filter(Boolean);
+    }
+
+    async function startDownload() {
+      const urls = getUrls();
+      if (urls.length === 0) return alert('কোনো URL নেই!');
+      if (urls.length > 40) return alert('সর্বোচ্চ ৪০টি URL দিতে পারবে।');
+
+      const btn = document.getElementById('startBtn');
+      btn.disabled = true;
+      document.getElementById('results').innerHTML = '';
+      document.getElementById('summary').style.display = 'none';
+      document.getElementById('progressWrap').style.display = 'block';
+      setProgress(0, 0, urls.length);
+      document.getElementById('currentStatus').textContent = '⏳ Job শুরু হচ্ছে...';
+
+      let jobId;
+      try {
+        const res = await fetch('/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls }),
+        });
+        const data = await res.json();
+        jobId = data.jobId;
+      } catch (err) {
+        alert('Server error: ' + err.message);
+        btn.disabled = false;
+        return;
+      }
+
+      const evtSource = new EventSource(`/progress/${jobId}`);
+      let done = 0, total = urls.length;
+
+      evtSource.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        total = d.total || total;
+
+        if (d.type === 'start') {
+          createResultItem(d.index, d.url, 'processing', '🔗 শুরু হচ্ছে...');
+          document.getElementById('progressLabel').textContent = `Processing ${d.index + 1} / ${total}`;
+        }
+        else if (['resolving','fetching','downloading','trimming','uploading'].includes(d.type)) {
+          const label = STEP_LABELS[d.type] || d.type;
+          document.getElementById('currentStatus').textContent = `[${d.index + 1}/${total}] ${label}`;
+          updateResultItem(d.index, 'processing', label, d.title);
+        }
+        else if (d.type === 'done') {
+          done++;
+          setProgress(done, done, total);
+          updateResultItem(d.index, 'success', null, d.title, d.fileName, d.driveLink);
+        }
+        else if (d.type === 'error') {
+          done++;
+          setProgress(done, done, total);
+          updateResultItem(d.index, 'failed', d.error);
+        }
+        else if (d.type === 'completed') {
+          setProgress(total, total, total);
+          document.getElementById('currentStatus').textContent = '✅ সব শেষ!';
+          document.getElementById('progressLabel').textContent = 'Completed';
+          showSummary(d.results || []);
+          btn.disabled = false;
+          evtSource.close();
+        }
+      };
+
+      evtSource.onerror = () => { btn.disabled = false; evtSource.close(); };
+    }
+
+    function createResultItem(index, url, state, msg) {
+      const container = document.getElementById('results');
+      const div = document.createElement('div');
+      div.id = `item-${index}`;
+      div.className = `result-item ${state}`;
+      div.innerHTML = `
+        <span class="badge ${state}">${state === 'processing' ? '⏳ PROCESSING' : state.toUpperCase()}</span>
+        <div class="url-text">${url}</div>
+        <div class="item-msg step-indicator">${msg}</div>`;
+      container.appendChild(div);
+    }
+
+    function updateResultItem(index, state, errorMsg, title, fileName, driveLink) {
+      const div = document.getElementById(`item-${index}`);
+      if (!div) return;
+      div.className = `result-item ${state}`;
+      const badge = div.querySelector('.badge');
+      badge.className = `badge ${state}`;
+      const msg = div.querySelector('.item-msg');
+
+      if (state === 'processing') {
+        badge.textContent = '⏳ PROCESSING';
+        msg.innerHTML = `<span class="step-indicator">${errorMsg}</span>`;
+      } else if (state === 'success') {
+        badge.textContent = '✓ SUCCESS';
+        msg.innerHTML = `
+          ${title ? `<div class="title-text">🎬 ${title}</div>` : ''}
+          <div class="file-name">📁 ${fileName}</div>
+          <div class="drive-link"><a href="${driveLink}" target="_blank">🔗 Google Drive-এ দেখো</a></div>`;
+      } else if (state === 'failed') {
+        badge.textContent = '✗ FAILED';
+        msg.innerHTML = `<div class="error-msg">⚠️ ${errorMsg}</div>`;
+      }
+    }
+
+    function setProgress(done, current, total) {
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressFraction').textContent = `${done} / ${total}`;
+    }
+
+    function showSummary(results) {
+      const success = results.filter(r => r.status === 'success').length;
+      const failed = results.filter(r => r.status === 'failed').length;
+      const s = document.getElementById('summary');
+      s.style.display = 'block';
+      s.innerHTML = `সম্পন্ন — <span>${success} সফল ✅</span> &nbsp;|&nbsp; <span>${failed} ব্যর্থ ❌</span> &nbsp;|&nbsp; মোট: <span>${results.length}</span>`;
+    }
+  </script>
+</body>
+</html>
