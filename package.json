@@ -1,0 +1,13 @@
+{
+  "name": "ks-bulk-downloader",
+  "version": "1.0.0",
+  "description": "Kuaishou Bulk Video Downloader → Google Drive",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^140.0.0"
+  }
+}
