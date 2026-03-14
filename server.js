@@ -42,10 +42,19 @@ async function uploadToDrive(filePath, fileName) {
 }
 
 // ─── HTTP Helper ─────────────────────────────────────────────────
-function httpGet(url, headers = {}, timeout = 15000) {
+function httpGet(url, headers = {}, timeout = 15000, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, { headers: { 'User-Agent': MOBILE_UA, ...headers }, timeout }, (res) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method,
+      headers: { 'User-Agent': MOBILE_UA, ...headers },
+      timeout,
+    };
+    if (body) options.headers['Content-Length'] = Buffer.byteLength(body);
+    const req = (method === 'POST' ? lib.request : lib.get)(method === 'POST' ? options : url, method === 'POST' ? undefined : { headers: { 'User-Agent': MOBILE_UA, ...headers }, timeout }, (res) => {
       // Follow redirects
       if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
         const next = res.headers.location.startsWith('http')
@@ -61,18 +70,21 @@ function httpGet(url, headers = {}, timeout = 15000) {
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout: ' + url)); });
+    if (body) req.write(body);
+    req.end();
   });
 }
 
 // ─── Extract photoId ─────────────────────────────────────────────
 function extractPhotoId(url) {
-  // chenzhongtech.com/fw/photo/XXXX or photoId=XXXX param
   const m1 = url.match(/\/fw\/photo\/([a-zA-Z0-9_-]+)/);
   if (m1) return m1[1];
   const m2 = url.match(/photoId=([a-zA-Z0-9_-]+)/);
   if (m2) return m2[1];
   const m3 = url.match(/short-video\/([a-zA-Z0-9_-]+)/);
   if (m3) return m3[1];
+  const m4 = url.match(/featured\/([a-zA-Z0-9_-]+)/);
+  if (m4) return m4[1];
   return null;
 }
 
@@ -80,7 +92,27 @@ function extractPhotoId(url) {
 // Strategy 1: parse HTML for <video src> or og:video
 // Strategy 2: call Kuaishou mobile API directly with photoId
 async function getVideoUrl(photoId, refererUrl) {
-  // Try mobile API endpoint (no captcha needed usually)
+  // Try video.kuaishou.com/graphql (works without captcha unlike www.kuaishou.com/graphql)
+  try {
+    const payload = JSON.stringify({
+      operationName: 'visionVideoDetail',
+      variables: { photoId, page: 'selected' },
+      query: 'query visionVideoDetail($photoId: String, $type: String, $page: String) { visionVideoDetail(photoId: $photoId, type: $type, page: $page) { photo { id caption coverUrl photoUrl } } }'
+    });
+    const res = await httpGet('https://video.kuaishou.com/graphql', {
+      'Content-Type': 'application/json',
+      'Referer': refererUrl || `https://www.kuaishou.com/short-video/${photoId}`,
+    }, 15000, 'POST', payload);
+    if (res.status === 200) {
+      const json = JSON.parse(res.body);
+      const photo = json?.data?.visionVideoDetail?.photo;
+      if (photo?.photoUrl) {
+        return { videoUrl: photo.photoUrl, title: (photo.caption || photoId).replace(/\n/g,'').trim() };
+      }
+    }
+  } catch(e) { console.log(`[GQL video.kuaishou] Failed: ${e.message}`); }
+
+  // Try mobile API endpoint
   const apiUrl = `https://m.kuaishou.com/rest/wd/photo/info/${photoId}?fid=${photoId}`;
   try {
     const res = await httpGet(apiUrl, {
